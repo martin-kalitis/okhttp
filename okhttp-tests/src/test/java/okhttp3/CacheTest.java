@@ -38,10 +38,10 @@ import javax.net.ssl.SSLSession;
 import okhttp3.internal.Internal;
 import okhttp3.internal.io.InMemoryFileSystem;
 import okhttp3.internal.platform.Platform;
-import okhttp3.internal.tls.SslClient;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.RecordedRequest;
+import okhttp3.tls.HandshakeCertificates;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
@@ -54,6 +54,7 @@ import org.junit.Test;
 
 import static okhttp3.TestUtil.defaultClient;
 import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_END;
+import static okhttp3.tls.internal.TlsUtil.localhost;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -72,7 +73,7 @@ public final class CacheTest {
   @Rule public MockWebServer server2 = new MockWebServer();
   @Rule public InMemoryFileSystem fileSystem = new InMemoryFileSystem();
 
-  private final SslClient sslClient = SslClient.localhost();
+  private final HandshakeCertificates handshakeCertificates = localhost();
   private OkHttpClient client;
   private Cache cache;
   private final CookieManager cookieManager = new CookieManager();
@@ -253,14 +254,15 @@ public final class CacheTest {
   }
 
   @Test public void secureResponseCaching() throws IOException {
-    server.useHttps(sslClient.socketFactory, false);
+    server.useHttps(handshakeCertificates.sslSocketFactory(), false);
     server.enqueue(new MockResponse()
         .addHeader("Last-Modified: " + formatDate(-1, TimeUnit.HOURS))
         .addHeader("Expires: " + formatDate(1, TimeUnit.HOURS))
         .setBody("ABC"));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
+        .sslSocketFactory(
+            handshakeCertificates.sslSocketFactory(), handshakeCertificates.trustManager())
         .hostnameVerifier(NULL_HOSTNAME_VERIFIER)
         .build();
 
@@ -349,7 +351,7 @@ public final class CacheTest {
   }
 
   @Test public void secureResponseCachingAndRedirects() throws IOException {
-    server.useHttps(sslClient.socketFactory, false);
+    server.useHttps(handshakeCertificates.sslSocketFactory(), false);
     server.enqueue(new MockResponse()
         .addHeader("Last-Modified: " + formatDate(-1, TimeUnit.HOURS))
         .addHeader("Expires: " + formatDate(1, TimeUnit.HOURS))
@@ -363,7 +365,8 @@ public final class CacheTest {
         .setBody("DEF"));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
+        .sslSocketFactory(
+            handshakeCertificates.sslSocketFactory(), handshakeCertificates.trustManager())
         .hostnameVerifier(NULL_HOSTNAME_VERIFIER)
         .build();
 
@@ -389,7 +392,7 @@ public final class CacheTest {
    * https://github.com/square/okhttp/issues/214
    */
   @Test public void secureResponseCachingAndProtocolRedirects() throws IOException {
-    server2.useHttps(sslClient.socketFactory, false);
+    server2.useHttps(handshakeCertificates.sslSocketFactory(), false);
     server2.enqueue(new MockResponse()
         .addHeader("Last-Modified: " + formatDate(-1, TimeUnit.HOURS))
         .addHeader("Expires: " + formatDate(1, TimeUnit.HOURS))
@@ -404,7 +407,8 @@ public final class CacheTest {
         .addHeader("Location: " + server2.url("/")));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
+        .sslSocketFactory(
+            handshakeCertificates.sslSocketFactory(), handshakeCertificates.trustManager())
         .hostnameVerifier(NULL_HOSTNAME_VERIFIER)
         .build();
 
@@ -745,8 +749,8 @@ public final class CacheTest {
   }
 
   private void testRequestMethod(String requestMethod, boolean expectCached) throws Exception {
-    // 1. seed the cache (potentially)
-    // 2. expect a cache hit or miss
+    // 1. Seed the cache (potentially).
+    // 2. Expect a cache hit or miss.
     server.enqueue(new MockResponse()
         .addHeader("Expires: " + formatDate(1, TimeUnit.HOURS))
         .addHeader("X-Response-ID: 1"));
@@ -774,7 +778,7 @@ public final class CacheTest {
 
   private RequestBody requestBodyOrNull(String requestMethod) {
     return (requestMethod.equals("POST") || requestMethod.equals("PUT"))
-        ? RequestBody.create(MediaType.parse("text/plain"), "foo")
+        ? RequestBody.create(MediaType.get("text/plain"), "foo")
         : null;
   }
 
@@ -791,9 +795,9 @@ public final class CacheTest {
   }
 
   private void testMethodInvalidates(String requestMethod) throws Exception {
-    // 1. seed the cache
-    // 2. invalidate it
-    // 3. expect a cache miss
+    // 1. Seed the cache.
+    // 2. Invalidate it.
+    // 3. Expect a cache miss.
     server.enqueue(new MockResponse()
         .setBody("A")
         .addHeader("Expires: " + formatDate(1, TimeUnit.HOURS)));
@@ -817,9 +821,9 @@ public final class CacheTest {
   }
 
   @Test public void postInvalidatesCacheWithUncacheableResponse() throws Exception {
-    // 1. seed the cache
-    // 2. invalidate it with uncacheable response
-    // 3. expect a cache miss
+    // 1. Seed the cache.
+    // 2. Invalidate it with an uncacheable response.
+    // 3. Expect a cache miss.
     server.enqueue(new MockResponse()
         .setBody("A")
         .addHeader("Expires: " + formatDate(1, TimeUnit.HOURS)));
@@ -839,6 +843,33 @@ public final class CacheTest {
         .build();
     Response invalidate = client.newCall(request).execute();
     assertEquals("B", invalidate.body().string());
+
+    assertEquals("C", get(url).body().string());
+  }
+
+  @Test public void putInvalidatesWithNoContentResponse() throws Exception {
+    // 1. Seed the cache.
+    // 2. Invalidate it.
+    // 3. Expect a cache miss.
+    server.enqueue(new MockResponse()
+        .setBody("A")
+        .addHeader("Expires: " + formatDate(1, TimeUnit.HOURS)));
+    server.enqueue(new MockResponse()
+        .clearHeaders()
+        .setResponseCode(HttpURLConnection.HTTP_NO_CONTENT));
+    server.enqueue(new MockResponse()
+        .setBody("C"));
+
+    HttpUrl url = server.url("/");
+
+    assertEquals("A", get(url).body().string());
+
+    Request request = new Request.Builder()
+        .url(url)
+        .put(RequestBody.create(MediaType.get("text/plain"), "foo"))
+        .build();
+    Response invalidate = client.newCall(request).execute();
+    assertEquals("", invalidate.body().string());
 
     assertEquals("C", get(url).body().string());
   }
@@ -908,8 +939,8 @@ public final class CacheTest {
   }
 
   @Test public void partialRangeResponsesDoNotCorruptCache() throws Exception {
-    // 1. request a range
-    // 2. request a full document, expecting a cache miss
+    // 1. Request a range.
+    // 2. Request a full document, expecting a cache miss.
     server.enqueue(new MockResponse()
         .setBody("AA")
         .setResponseCode(HttpURLConnection.HTTP_PARTIAL)
@@ -1004,6 +1035,43 @@ public final class CacheTest {
     assertEquals("ABCABCABC", get(server.url("/")).body().string());
     assertEquals("ABCABCABC", get(server.url("/")).body().string());
     assertEquals("ABCABCABC", get(server.url("/")).body().string());
+  }
+
+  @Test public void previouslyNotGzippedContentIsNotModifiedAndSpecifiesGzipEncoding() throws Exception {
+    server.enqueue(new MockResponse()
+            .setBody("ABCABCABC")
+            .addHeader("Content-Type: text/plain")
+            .addHeader("Last-Modified: " + formatDate(-2, TimeUnit.HOURS))
+            .addHeader("Expires: " + formatDate(-1, TimeUnit.HOURS)));
+    server.enqueue(new MockResponse()
+            .setResponseCode(HttpURLConnection.HTTP_NOT_MODIFIED)
+            .addHeader("Content-Type: text/plain")
+            .addHeader("Content-Encoding: gzip"));
+    server.enqueue(new MockResponse()
+            .setBody("DEFDEFDEF"));
+
+    assertEquals("ABCABCABC", get(server.url("/")).body().string());
+    assertEquals("ABCABCABC", get(server.url("/")).body().string());
+    assertEquals("DEFDEFDEF", get(server.url("/")).body().string());
+  }
+
+  @Test public void changedGzippedContentIsNotModifiedAndSpecifiesNewEncoding() throws Exception {
+    server.enqueue(new MockResponse()
+            .setBody(gzip("ABCABCABC"))
+            .addHeader("Content-Type: text/plain")
+            .addHeader("Last-Modified: " + formatDate(-2, TimeUnit.HOURS))
+            .addHeader("Expires: " + formatDate(-1, TimeUnit.HOURS))
+            .addHeader("Content-Encoding: gzip"));
+    server.enqueue(new MockResponse()
+            .setResponseCode(HttpURLConnection.HTTP_NOT_MODIFIED)
+            .addHeader("Content-Type: text/plain")
+            .addHeader("Content-Encoding: identity"));
+    server.enqueue(new MockResponse()
+            .setBody("DEFDEFDEF"));
+
+    assertEquals("ABCABCABC", get(server.url("/")).body().string());
+    assertEquals("ABCABCABC", get(server.url("/")).body().string());
+    assertEquals("DEFDEFDEF", get(server.url("/")).body().string());
   }
 
   @Test public void notModifiedSpecifiesEncoding() throws Exception {
@@ -1314,7 +1382,7 @@ public final class CacheTest {
     Date lastModifiedDate = new Date(System.currentTimeMillis() + TimeUnit.HOURS.toMillis(-1));
     Date servedDate = new Date(System.currentTimeMillis() + TimeUnit.HOURS.toMillis(-2));
     DateFormat dateFormat = new SimpleDateFormat("EEE dd-MMM-yyyy HH:mm:ss z", Locale.US);
-    dateFormat.setTimeZone(TimeZone.getTimeZone("EDT"));
+    dateFormat.setTimeZone(TimeZone.getTimeZone("America/New_York"));
     String lastModifiedString = dateFormat.format(lastModifiedDate);
     String servedString = dateFormat.format(servedDate);
 
@@ -1692,7 +1760,7 @@ public final class CacheTest {
   }
 
   @Test public void varyAndHttps() throws Exception {
-    server.useHttps(sslClient.socketFactory, false);
+    server.useHttps(handshakeCertificates.sslSocketFactory(), false);
     server.enqueue(new MockResponse()
         .addHeader("Cache-Control: max-age=60")
         .addHeader("Vary: Accept-Language")
@@ -1701,7 +1769,8 @@ public final class CacheTest {
         .setBody("B"));
 
     client = client.newBuilder()
-        .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
+        .sslSocketFactory(
+            handshakeCertificates.sslSocketFactory(), handshakeCertificates.trustManager())
         .hostnameVerifier(NULL_HOSTNAME_VERIFIER)
         .build();
 
@@ -2451,6 +2520,33 @@ public final class CacheTest {
 
     server.takeRequest(); // regular get
     return server.takeRequest(); // conditional get
+  }
+
+  @Test public void immutableIsCached() throws Exception {
+    server.enqueue(new MockResponse()
+        .addHeader("Cache-Control", "immutable")
+        .setBody("A"));
+    server.enqueue(new MockResponse()
+        .setBody("B"));
+
+    HttpUrl url = server.url("/");
+    assertEquals("A", get(url).body().string());
+    assertEquals("A", get(url).body().string());
+  }
+
+  @Test public void immutableIsCachedAfterMultipleCalls() throws Exception {
+    server.enqueue(new MockResponse()
+        .setBody("A"));
+    server.enqueue(new MockResponse()
+        .addHeader("Cache-Control", "immutable")
+        .setBody("B"));
+    server.enqueue(new MockResponse()
+        .setBody("C"));
+
+    HttpUrl url = server.url("/");
+    assertEquals("A", get(url).body().string());
+    assertEquals("B", get(url).body().string());
+    assertEquals("B", get(url).body().string());
   }
 
   private void assertFullyCached(MockResponse response) throws Exception {

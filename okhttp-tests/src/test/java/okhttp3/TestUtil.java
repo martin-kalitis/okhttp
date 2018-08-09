@@ -1,5 +1,6 @@
 package okhttp3;
 
+import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -7,6 +8,9 @@ import okhttp3.internal.SingleInetAddressDns;
 import okhttp3.internal.http2.Header;
 
 public final class TestUtil {
+  public static final InetSocketAddress UNREACHABLE_ADDRESS
+      = new InetSocketAddress("198.51.100.1", 8080);
+
   private TestUtil() {
   }
 
@@ -49,7 +53,7 @@ public final class TestUtil {
    * https://android.googlesource.com/platform/libcore/+/master/support/src/test/java/libcore/
    * java/lang/ref/FinalizationTester.java
    */
-  public static void awaitGarbageCollection() throws InterruptedException {
+  public static void awaitGarbageCollection() throws Exception {
     Runtime.getRuntime().gc();
     Thread.sleep(100);
     System.runFinalization();

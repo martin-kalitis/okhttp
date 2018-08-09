@@ -127,4 +127,76 @@ public final class OkHttpClientTest {
     OkHttpClient clientB = TestUtil.defaultClient();
     assertEquals(clientA.certificatePinner(), clientB.certificatePinner());
   }
+
+  @Test public void nullInterceptor() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    try {
+      builder.addInterceptor(null);
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("interceptor == null", expected.getMessage());
+    }
+  }
+
+  @Test public void nullNetworkInterceptor() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    try {
+      builder.addNetworkInterceptor(null);
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("interceptor == null", expected.getMessage());
+    }
+  }
+
+  @Test public void nullInterceptorInList() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    builder.interceptors().add(null);
+    try {
+      builder.build();
+      fail();
+    } catch (IllegalStateException expected) {
+      assertEquals("Null interceptor: [null]", expected.getMessage());
+    }
+  }
+
+  @Test public void nullNetworkInterceptorInList() {
+    OkHttpClient.Builder builder = new OkHttpClient.Builder();
+    builder.networkInterceptors().add(null);
+    try {
+      builder.build();
+      fail();
+    } catch (IllegalStateException expected) {
+      assertEquals("Null network interceptor: [null]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2PriorKnowledgeOkHttpClientConstructionFallback() {
+    try {
+      new OkHttpClient.Builder()
+          .protocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.HTTP_1_1));
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2_prior_knowledge cannot use other protocols: "
+          + "[h2_prior_knowledge, http/1.1]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2PriorKnowledgeOkHttpClientConstructionDuplicates() {
+    try {
+      new OkHttpClient.Builder()
+          .protocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.H2_PRIOR_KNOWLEDGE));
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2_prior_knowledge cannot use other protocols: "
+          + "[h2_prior_knowledge, h2_prior_knowledge]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2PriorKnowledgeOkHttpClientConstructionSuccess() {
+    OkHttpClient okHttpClient = new OkHttpClient.Builder()
+        .protocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE))
+        .build();
+    assertEquals(1, okHttpClient.protocols().size());
+    assertEquals(Protocol.H2_PRIOR_KNOWLEDGE, okHttpClient.protocols().get(0));
+  }
 }

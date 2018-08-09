@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import okhttp3.Headers;
+import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
 import okhttp3.Request;
@@ -31,9 +32,11 @@ import okhttp3.internal.Internal;
 import okhttp3.internal.Util;
 import okhttp3.internal.connection.StreamAllocation;
 import okhttp3.internal.http.HttpCodec;
+import okhttp3.internal.http.HttpHeaders;
 import okhttp3.internal.http.RealResponseBody;
 import okhttp3.internal.http.RequestLine;
 import okhttp3.internal.http.StatusLine;
+import okio.Buffer;
 import okio.ByteString;
 import okio.ForwardingSource;
 import okio.Okio;
@@ -82,16 +85,20 @@ public final class Http2Codec implements HttpCodec {
       ENCODING,
       UPGRADE);
 
-  private final OkHttpClient client;
+  private final Interceptor.Chain chain;
   final StreamAllocation streamAllocation;
   private final Http2Connection connection;
   private Http2Stream stream;
+  private final Protocol protocol;
 
-  public Http2Codec(
-      OkHttpClient client, StreamAllocation streamAllocation, Http2Connection connection) {
-    this.client = client;
+  public Http2Codec(OkHttpClient client, Interceptor.Chain chain, StreamAllocation streamAllocation,
+      Http2Connection connection) {
+    this.chain = chain;
     this.streamAllocation = streamAllocation;
     this.connection = connection;
+    this.protocol = client.protocols().contains(Protocol.H2_PRIOR_KNOWLEDGE)
+        ? Protocol.H2_PRIOR_KNOWLEDGE
+        : Protocol.HTTP_2;
   }
 
   @Override public Sink createRequestBody(Request request, long contentLength) {
@@ -104,8 +111,8 @@ public final class Http2Codec implements HttpCodec {
     boolean hasRequestBody = request.body() != null;
     List<Header> requestHeaders = http2HeadersList(request);
     stream = connection.newStream(requestHeaders, hasRequestBody);
-    stream.readTimeout().timeout(client.readTimeoutMillis(), TimeUnit.MILLISECONDS);
-    stream.writeTimeout().timeout(client.writeTimeoutMillis(), TimeUnit.MILLISECONDS);
+    stream.readTimeout().timeout(chain.readTimeoutMillis(), TimeUnit.MILLISECONDS);
+    stream.writeTimeout().timeout(chain.writeTimeoutMillis(), TimeUnit.MILLISECONDS);
   }
 
   @Override public void flushRequest() throws IOException {
@@ -118,7 +125,7 @@ public final class Http2Codec implements HttpCodec {
 
   @Override public Response.Builder readResponseHeaders(boolean expectContinue) throws IOException {
     List<Header> headers = stream.takeResponseHeaders();
-    Response.Builder responseBuilder = readHttp2HeadersList(headers);
+    Response.Builder responseBuilder = readHttp2HeadersList(headers, protocol);
     if (expectContinue && Internal.instance.code(responseBuilder) == HTTP_CONTINUE) {
       return null;
     }
@@ -130,7 +137,10 @@ public final class Http2Codec implements HttpCodec {
     List<Header> result = new ArrayList<>(headers.size() + 4);
     result.add(new Header(TARGET_METHOD, request.method()));
     result.add(new Header(TARGET_PATH, RequestLine.requestPath(request.url())));
-    result.add(new Header(TARGET_AUTHORITY, Util.hostHeader(request.url(), false))); // Optional.
+    String host = request.header("Host");
+    if (host != null) {
+      result.add(new Header(TARGET_AUTHORITY, host)); // Optional.
+    }
     result.add(new Header(TARGET_SCHEME, request.url().scheme()));
 
     for (int i = 0, size = headers.size(); i < size; i++) {
@@ -144,7 +154,8 @@ public final class Http2Codec implements HttpCodec {
   }
 
   /** Returns headers for a name value block containing an HTTP/2 response. */
-  public static Response.Builder readHttp2HeadersList(List<Header> headerBlock) throws IOException {
+  public static Response.Builder readHttp2HeadersList(List<Header> headerBlock,
+      Protocol protocol) throws IOException {
     StatusLine statusLine = null;
     Headers.Builder headersBuilder = new Headers.Builder();
     for (int i = 0, size = headerBlock.size(); i < size; i++) {
@@ -171,15 +182,18 @@ public final class Http2Codec implements HttpCodec {
     if (statusLine == null) throw new ProtocolException("Expected ':status' header not present");
 
     return new Response.Builder()
-        .protocol(Protocol.HTTP_2)
+        .protocol(protocol)
         .code(statusLine.code)
         .message(statusLine.message)
         .headers(headersBuilder.build());
   }
 
   @Override public ResponseBody openResponseBody(Response response) throws IOException {
+    streamAllocation.eventListener.responseBodyStart(streamAllocation.call);
+    String contentType = response.header("Content-Type");
+    long contentLength = HttpHeaders.contentLength(response);
     Source source = new StreamFinishingSource(stream.getSource());
-    return new RealResponseBody(response.headers(), Okio.buffer(source));
+    return new RealResponseBody(contentType, contentLength, Okio.buffer(source));
   }
 
   @Override public void cancel() {
@@ -187,13 +201,35 @@ public final class Http2Codec implements HttpCodec {
   }
 
   class StreamFinishingSource extends ForwardingSource {
-    public StreamFinishingSource(Source delegate) {
+    boolean completed = false;
+    long bytesRead = 0;
+
+    StreamFinishingSource(Source delegate) {
       super(delegate);
     }
 
+    @Override public long read(Buffer sink, long byteCount) throws IOException {
+      try {
+        long read = delegate().read(sink, byteCount);
+        if (read > 0) {
+          bytesRead += read;
+        }
+        return read;
+      } catch (IOException e) {
+        endOfInput(e);
+        throw e;
+      }
+    }
+
     @Override public void close() throws IOException {
-      streamAllocation.streamFinished(false, Http2Codec.this);
       super.close();
+      endOfInput(null);
+    }
+
+    private void endOfInput(IOException e) {
+      if (completed) return;
+      completed = true;
+      streamAllocation.streamFinished(false, Http2Codec.this, bytesRead, e);
     }
   }
 }

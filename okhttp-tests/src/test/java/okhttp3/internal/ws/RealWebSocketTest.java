@@ -18,6 +18,7 @@ package okhttp3.internal.ws;
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.ProtocolException;
+import java.net.SocketTimeoutException;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import okhttp3.Protocol;
@@ -34,6 +35,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public final class RealWebSocketTest {
   // NOTE: Fields are named 'client' and 'server' for cognitive simplicity. This differentiation has
@@ -52,9 +54,13 @@ public final class RealWebSocketTest {
     server.initWebSocket(random, 0);
   }
 
-  @After public void tearDown() {
+  @After public void tearDown() throws Exception {
     client.listener.assertExhausted();
     server.listener.assertExhausted();
+    server.source.close();
+    client.source.close();
+    server.webSocket.tearDown();
+    client.webSocket.tearDown();
   }
 
   @Test public void close() throws IOException {
@@ -73,6 +79,15 @@ public final class RealWebSocketTest {
 
     assertFalse(client.webSocket.close(1000, "Hello!"));
     assertFalse(client.webSocket.send("Hello!"));
+  }
+
+  @Test public void clientCloseWith0Fails() throws IOException {
+    try {
+      client.webSocket.close(0, null);
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals(expected.getMessage(), "Code must be in range [1000,5000): 0");
+    }
   }
 
   @Test public void afterSocketClosedPingFailsWebSocket() throws IOException {
@@ -199,7 +214,7 @@ public final class RealWebSocketTest {
     client.listener.assertFailure(ProtocolException.class, "Control frames must be final.");
 
     server.processNextFrame();
-    server.listener.assertFailure(EOFException.class, null);
+    server.listener.assertFailure(EOFException.class);
   }
 
   @Test public void protocolErrorInCloseResponseClosesConnection() throws IOException {
@@ -238,7 +253,7 @@ public final class RealWebSocketTest {
   @Test public void networkErrorReportedAsFailure() throws IOException {
     server.sink.close();
     client.processNextFrame();
-    client.listener.assertFailure(EOFException.class, null);
+    client.listener.assertFailure(EOFException.class);
   }
 
   @Test public void closeThrowingFailsConnection() throws IOException {
@@ -290,6 +305,43 @@ public final class RealWebSocketTest {
     assertEquals(1500, TimeUnit.NANOSECONDS.toMillis(elapsedUntilPing3), 250d);
   }
 
+  @Test public void unacknowledgedPingFailsConnection() throws IOException {
+    long startNanos = System.nanoTime();
+    client.initWebSocket(random, 500);
+
+    // Don't process the ping and pong frames!
+    client.listener.assertFailure(SocketTimeoutException.class,
+        "sent ping but didn't receive pong within 500ms (after 0 successful ping/pongs)");
+    long elapsedUntilFailure = System.nanoTime() - startNanos;
+    assertEquals(1000, TimeUnit.NANOSECONDS.toMillis(elapsedUntilFailure), 250d);
+  }
+
+  @Test public void unexpectedPongsDoNotInterfereWithFailureDetection() throws IOException {
+    long startNanos = System.nanoTime();
+    client.initWebSocket(random, 500);
+
+    // At 0ms the server sends 3 unexpected pongs. The client accepts 'em and ignores em.
+    server.webSocket.pong(ByteString.encodeUtf8("pong 1"));
+    client.processNextFrame();
+    server.webSocket.pong(ByteString.encodeUtf8("pong 2"));
+    client.processNextFrame();
+    server.webSocket.pong(ByteString.encodeUtf8("pong 3"));
+    client.processNextFrame();
+
+    // After 500ms the client automatically pings and the server pongs back.
+    server.processNextFrame(); // Ping.
+    client.processNextFrame(); // Pong.
+    long elapsedUntilPing = System.nanoTime() - startNanos;
+    assertEquals(500, TimeUnit.NANOSECONDS.toMillis(elapsedUntilPing), 250d);
+
+    // After 1000ms the client will attempt a ping 2, but we don't process it. That'll cause the
+    // client to fail at 1500ms when it's time to send ping 3 because pong 2 hasn't been received.
+    client.listener.assertFailure(SocketTimeoutException.class,
+        "sent ping but didn't receive pong within 500ms (after 1 successful ping/pongs)");
+    long elapsedUntilFailure = System.nanoTime() - startNanos;
+    assertEquals(1500, TimeUnit.NANOSECONDS.toMillis(elapsedUntilFailure), 250d);
+  }
+
   /** One peer's streams, listener, and web socket in the test. */
   private static class TestStreams extends RealWebSocket.Streams {
     private final String name;
@@ -308,11 +360,12 @@ public final class RealWebSocketTest {
       String url = "http://example.com/websocket";
       Response response = new Response.Builder()
           .code(101)
+          .message("OK")
           .request(new Request.Builder().url(url).build())
           .protocol(Protocol.HTTP_1_1)
           .build();
-      webSocket = new RealWebSocket(response.request(), listener, random);
-      webSocket.initReaderAndWriter(name, pingIntervalMillis, this);
+      webSocket = new RealWebSocket(response.request(), listener, random, pingIntervalMillis);
+      webSocket.initReaderAndWriter(name, this);
     }
 
     public boolean processNextFrame() throws IOException {

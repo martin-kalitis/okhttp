@@ -27,13 +27,21 @@ import java.net.ProtocolException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.net.ssl.HttpsURLConnection;
+import okhttp3.Handshake;
 import okhttp3.Headers;
+import okhttp3.HttpUrl;
+import okhttp3.Protocol;
+import okhttp3.RecordingHostnameVerifier;
 import okhttp3.internal.Util;
+import okhttp3.tls.HeldCertificate;
+import okhttp3.tls.HandshakeCertificates;
 import org.junit.After;
 import org.junit.Rule;
 import org.junit.Test;
@@ -42,9 +50,11 @@ import org.junit.runners.model.Statement;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static okhttp3.tls.internal.TlsUtil.localhost;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -103,6 +113,17 @@ public final class MockWebServerTest {
         .addHeader("Cookies: delicious");
     response.setHeader("cookie", "r=robot");
     assertEquals(Arrays.asList("Cookies: delicious", "cookie: r=robot"), headersToList(response));
+  }
+
+  @Test public void mockResponseSetHeaders() {
+    MockResponse response = new MockResponse()
+        .clearHeaders()
+        .addHeader("Cookie: s=square")
+        .addHeader("Cookies: delicious");
+
+    response.setHeaders(new Headers.Builder().add("Cookie", "a=android").build());
+
+    assertEquals(Arrays.asList("Cookie: a=android"), headersToList(response));
   }
 
   @Test public void regularResponse() throws Exception {
@@ -280,7 +301,7 @@ public final class MockWebServerTest {
     in.close();
   }
 
-  @Test public void disconnectRequestHalfway() throws IOException {
+  @Test public void disconnectRequestHalfway() throws Exception {
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_DURING_REQUEST_BODY));
     // Limit the size of the request body that the server holds in memory to an arbitrary
     // 3.5 MBytes so this test can pass on devices with little memory.
@@ -299,11 +320,15 @@ public final class MockWebServerTest {
       try {
         out.write(data);
         out.flush();
+        if (i == 513) {
+          // pause slightly after half way to make result more predictable
+          Thread.sleep(100);
+        }
       } catch (IOException e) {
         break;
       }
     }
-    assertEquals(512f, i, 10f); // Halfway +/- 1%
+    assertEquals(512f, i, 5f); // Halfway +/- 0.5%
   }
 
   @Test public void disconnectResponseHalfway() throws IOException {
@@ -404,5 +429,144 @@ public final class MockWebServerTest {
 
     // Shutting down the server should unblock the dispatcher.
     server.shutdown();
+  }
+
+  @Test public void requestUrlReconstructed() throws Exception {
+    server.enqueue(new MockResponse().setBody("hello world"));
+
+    URL url = server.url("/a/deep/path?key=foo%20bar").url();
+    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+    InputStream in = connection.getInputStream();
+    BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+    assertEquals(HttpURLConnection.HTTP_OK, connection.getResponseCode());
+    assertEquals("hello world", reader.readLine());
+
+    RecordedRequest request = server.takeRequest();
+    assertEquals("GET /a/deep/path?key=foo%20bar HTTP/1.1", request.getRequestLine());
+
+    HttpUrl requestUrl = request.getRequestUrl();
+    assertEquals("http", requestUrl.scheme());
+    assertEquals(server.getHostName(), requestUrl.host());
+    assertEquals(server.getPort(), requestUrl.port());
+    assertEquals("/a/deep/path", requestUrl.encodedPath());
+    assertEquals("foo bar", requestUrl.queryParameter("key"));
+  }
+
+  @Test public void http100Continue() throws Exception {
+    server.enqueue(new MockResponse().setBody("response"));
+
+    URL url = server.url("/").url();
+    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+    connection.setDoOutput(true);
+    connection.setRequestProperty("Expect", "100-Continue");
+    connection.getOutputStream().write("request".getBytes(StandardCharsets.UTF_8));
+
+    InputStream in = connection.getInputStream();
+    BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+    assertEquals("response", reader.readLine());
+
+    RecordedRequest request = server.takeRequest();
+    assertEquals("request", request.getBody().readUtf8());
+  }
+
+  @Test public void testH2PriorKnowledgeServerFallback() {
+    try {
+      server.setProtocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.HTTP_1_1));
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2_prior_knowledge cannot use other protocols: "
+              + "[h2_prior_knowledge, http/1.1]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2PriorKnowledgeServerDuplicates() {
+    try {
+      // Treating this use case as user error
+      server.setProtocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.H2_PRIOR_KNOWLEDGE));
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2_prior_knowledge cannot use other protocols: "
+          + "[h2_prior_knowledge, h2_prior_knowledge]", expected.getMessage());
+    }
+  }
+
+  @Test public void testMockWebServerH2PriorKnowledgeProtocol() {
+    server.setProtocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE));
+
+    assertEquals(1, server.protocols().size());
+    assertEquals(Protocol.H2_PRIOR_KNOWLEDGE, server.protocols().get(0));
+  }
+
+  @Test public void https() throws Exception {
+    HandshakeCertificates handshakeCertificates = localhost();
+    server.useHttps(handshakeCertificates.sslSocketFactory(), false);
+    server.enqueue(new MockResponse().setBody("abc"));
+
+    HttpUrl url = server.url("/");
+    HttpsURLConnection connection = (HttpsURLConnection) url.url().openConnection();
+    connection.setSSLSocketFactory(handshakeCertificates.sslSocketFactory());
+    connection.setHostnameVerifier(new RecordingHostnameVerifier());
+
+    assertEquals(HttpURLConnection.HTTP_OK, connection.getResponseCode());
+    BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+    assertEquals("abc", reader.readLine());
+
+    RecordedRequest request = server.takeRequest();
+    assertEquals("https", request.getRequestUrl().scheme());
+    Handshake handshake = request.getHandshake();
+    assertNotNull(handshake.tlsVersion());
+    assertNotNull(handshake.cipherSuite());
+    assertNotNull(handshake.localPrincipal());
+    assertEquals(1, handshake.localCertificates().size());
+    assertNull(handshake.peerPrincipal());
+    assertEquals(0, handshake.peerCertificates().size());
+  }
+
+  @Test public void httpsWithClientAuth() throws Exception {
+    HeldCertificate clientCa = new HeldCertificate.Builder()
+        .certificateAuthority(0)
+        .build();
+    HeldCertificate serverCa = new HeldCertificate.Builder()
+        .certificateAuthority(0)
+        .build();
+    HeldCertificate serverCertificate = new HeldCertificate.Builder()
+        .signedBy(serverCa)
+        .addSubjectAlternativeName(server.getHostName())
+        .build();
+    HandshakeCertificates serverHandshakeCertificates = new HandshakeCertificates.Builder()
+        .addTrustedCertificate(clientCa.certificate())
+        .heldCertificate(serverCertificate)
+        .build();
+
+    server.useHttps(serverHandshakeCertificates.sslSocketFactory(), false);
+    server.enqueue(new MockResponse().setBody("abc"));
+    server.requestClientAuth();
+
+    HeldCertificate clientCertificate = new HeldCertificate.Builder()
+        .signedBy(clientCa)
+        .build();
+    HandshakeCertificates clientHandshakeCertificates = new HandshakeCertificates.Builder()
+        .addTrustedCertificate(serverCa.certificate())
+        .heldCertificate(clientCertificate)
+        .build();
+
+    HttpUrl url = server.url("/");
+    HttpsURLConnection connection = (HttpsURLConnection) url.url().openConnection();
+    connection.setSSLSocketFactory(clientHandshakeCertificates.sslSocketFactory());
+    connection.setHostnameVerifier(new RecordingHostnameVerifier());
+
+    assertEquals(HttpURLConnection.HTTP_OK, connection.getResponseCode());
+    BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+    assertEquals("abc", reader.readLine());
+
+    RecordedRequest request = server.takeRequest();
+    assertEquals("https", request.getRequestUrl().scheme());
+    Handshake handshake = request.getHandshake();
+    assertNotNull(handshake.tlsVersion());
+    assertNotNull(handshake.cipherSuite());
+    assertNotNull(handshake.localPrincipal());
+    assertEquals(1, handshake.localCertificates().size());
+    assertNotNull(handshake.peerPrincipal());
+    assertEquals(1, handshake.peerCertificates().size());
   }
 }

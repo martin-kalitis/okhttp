@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import javax.annotation.Nullable;
 import okhttp3.internal.Util;
 import okhttp3.internal.http.HttpDate;
 
@@ -58,7 +59,7 @@ public final class Headers {
   }
 
   /** Returns the last value corresponding to the specified field, or null. */
-  public String get(String name) {
+  public @Nullable String get(String name) {
     return get(namesAndValues, name);
   }
 
@@ -66,7 +67,7 @@ public final class Headers {
    * Returns the last value corresponding to the specified field parsed as an HTTP date, or null if
    * either the field is absent or cannot be parsed as a date.
    */
-  public Date getDate(String name) {
+  public @Nullable Date getDate(String name) {
     String value = get(name);
     return value != null ? HttpDate.parse(value) : null;
   }
@@ -109,6 +110,23 @@ public final class Headers {
         : Collections.<String>emptyList();
   }
 
+  /**
+   * Returns the number of bytes required to encode these headers using HTTP/1.1. This is also the
+   * approximate size of HTTP/2 headers before they are compressed with HPACK. This value is
+   * intended to be used as a metric: smaller headers are more efficient to encode and transmit.
+   */
+  public long byteCount() {
+    // Each header name has 2 bytes of overhead for ': ' and every header value has 2 bytes of
+    // overhead for '\r\n'.
+    long result = namesAndValues.length * 2;
+
+    for (int i = 0, size = namesAndValues.length; i < size; i++) {
+      result += namesAndValues[i].length();
+    }
+
+    return result;
+  }
+
   public Builder newBuilder() {
     Builder result = new Builder();
     Collections.addAll(result.namesAndValues, namesAndValues);
@@ -141,7 +159,7 @@ public final class Headers {
    * Applications that require semantically equal headers should convert them into a canonical form
    * before comparing them for equality.
    */
-  @Override public boolean equals(Object other) {
+  @Override public boolean equals(@Nullable Object other) {
     return other instanceof Headers
         && Arrays.equals(((Headers) other).namesAndValues, namesAndValues);
   }
@@ -265,10 +283,24 @@ public final class Headers {
       return add(line.substring(0, index).trim(), line.substring(index + 1));
     }
 
-    /** Add a field with the specified value. */
+    /**
+     * Add a header with the specified name and value. Does validation of header names and values.
+     */
     public Builder add(String name, String value) {
       checkNameAndValue(name, value);
       return addLenient(name, value);
+    }
+
+    /**
+     * Adds all headers from an existing collection.
+     */
+    public Builder addAll(Headers headers) {
+      int size = headers.size();
+      for (int i = 0; i < size; i++) {
+        addLenient(headers.name(i), headers.value(i));
+      }
+
+      return this;
     }
 
     /**
@@ -313,7 +345,7 @@ public final class Headers {
               "Unexpected char %#04x at %d in header name: %s", (int) c, i, name));
         }
       }
-      if (value == null) throw new NullPointerException("value == null");
+      if (value == null) throw new NullPointerException("value for name " + name + " == null");
       for (int i = 0, length = value.length(); i < length; i++) {
         char c = value.charAt(i);
         if ((c <= '\u001f' && c != '\t') || c >= '\u007f') {

@@ -15,19 +15,17 @@
  */
 package okhttp3.internal;
 
-import java.io.Closeable;
-import java.net.MalformedURLException;
-import java.net.UnknownHostException;
+import java.net.Socket;
 import javax.net.ssl.SSLSocket;
 import okhttp3.Address;
 import okhttp3.Call;
 import okhttp3.ConnectionPool;
 import okhttp3.ConnectionSpec;
 import okhttp3.Headers;
-import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
+import okhttp3.Route;
 import okhttp3.internal.cache.InternalCache;
 import okhttp3.internal.connection.RealConnection;
 import okhttp3.internal.connection.RouteDatabase;
@@ -52,10 +50,12 @@ public abstract class Internal {
 
   public abstract void setCache(OkHttpClient.Builder builder, InternalCache internalCache);
 
-  public abstract RealConnection get(
-      ConnectionPool pool, Address address, StreamAllocation streamAllocation);
+  public abstract RealConnection get(ConnectionPool pool, Address address,
+      StreamAllocation streamAllocation, Route route);
 
-  public abstract Closeable deduplicate(
+  public abstract boolean equalsNonHost(Address a, Address b);
+
+  public abstract Socket deduplicate(
       ConnectionPool pool, Address address, StreamAllocation streamAllocation);
 
   public abstract void put(ConnectionPool pool, RealConnection connection);
@@ -69,8 +69,7 @@ public abstract class Internal {
   public abstract void apply(ConnectionSpec tlsConfiguration, SSLSocket sslSocket,
       boolean isFallback);
 
-  public abstract HttpUrl getHttpUrlChecked(String url)
-      throws MalformedURLException, UnknownHostException;
+  public abstract boolean isInvalidHttpUrlHost(IllegalArgumentException e);
 
   public abstract StreamAllocation streamAllocation(Call call);
 

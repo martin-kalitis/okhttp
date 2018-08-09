@@ -34,7 +34,7 @@ public final class Http2Stream {
   // blocking operations are performed while the lock is held.
 
   /**
-   * The total number of bytes consumed by the application (with {@link FramedDataSource#read}), but
+   * The total number of bytes consumed by the application (with {@link FramingSource#read}), but
    * not yet acknowledged by sending a {@code WINDOW_UPDATE} frame on this stream.
    */
   // Visible for testing
@@ -60,8 +60,8 @@ public final class Http2Stream {
   /** True if response headers have been sent or received. */
   private boolean hasResponseHeaders;
 
-  private final FramedDataSource source;
-  final FramedDataSink sink;
+  private final FramingSource source;
+  final FramingSink sink;
   final StreamTimeout readTimeout = new StreamTimeout();
   final StreamTimeout writeTimeout = new StreamTimeout();
 
@@ -80,9 +80,8 @@ public final class Http2Stream {
     this.connection = connection;
     this.bytesLeftInWriteWindow =
         connection.peerSettings.getInitialWindowSize();
-    this.source = new FramedDataSource(
-        connection.okHttpSettings.getInitialWindowSize());
-    this.sink = new FramedDataSink();
+    this.source = new FramingSource(connection.okHttpSettings.getInitialWindowSize());
+    this.sink = new FramingSink();
     this.source.finished = inFinished;
     this.sink.finished = outFinished;
     this.requestHeaders = requestHeaders;
@@ -174,16 +173,27 @@ public final class Http2Stream {
       throw new NullPointerException("responseHeaders == null");
     }
     boolean outFinished = false;
+    boolean flushHeaders = false;
     synchronized (this) {
       this.hasResponseHeaders = true;
       if (!out) {
         this.sink.finished = true;
+        flushHeaders = true;
         outFinished = true;
       }
     }
+
+    // Only DATA frames are subject to flow-control. Transmit the HEADER frame if the connection
+    // flow-control window is fully depleted.
+    if (!flushHeaders) {
+      synchronized (connection) {
+        flushHeaders = connection.bytesLeftInWriteWindow == 0L;
+      }
+    }
+
     connection.writeSynReply(id, outFinished, responseHeaders);
 
-    if (outFinished) {
+    if (flushHeaders) {
       connection.flush();
     }
   }
@@ -307,11 +317,11 @@ public final class Http2Stream {
    * synchronization to safely receive incoming data frames, it is not intended for use by multiple
    * readers.
    */
-  private final class FramedDataSource implements Source {
+  private final class FramingSource implements Source {
     /** Buffer to receive data from the network into. Only accessed by the reader thread. */
     private final Buffer receiveBuffer = new Buffer();
 
-    /** Buffer with readable data. Guarded by FramedStream.this. */
+    /** Buffer with readable data. Guarded by Http2Stream.this. */
     private final Buffer readBuffer = new Buffer();
 
     /** Maximum number of bytes to buffer before reporting a flow control error. */
@@ -326,42 +336,57 @@ public final class Http2Stream {
      */
     boolean finished;
 
-    FramedDataSource(long maxByteCount) {
+    FramingSource(long maxByteCount) {
       this.maxByteCount = maxByteCount;
     }
 
     @Override public long read(Buffer sink, long byteCount) throws IOException {
       if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
 
-      long read;
+      long read = -1;
+      ErrorCode errorCode;
       synchronized (Http2Stream.this) {
         waitUntilReadable();
-        checkNotClosed();
-        if (readBuffer.size() == 0) return -1; // This source is exhausted.
+        if (closed) {
+          throw new IOException("stream closed");
+        }
+        errorCode = Http2Stream.this.errorCode;
 
-        // Move bytes from the read buffer into the caller's buffer.
-        read = readBuffer.read(sink, Math.min(byteCount, readBuffer.size()));
+        if (readBuffer.size() > 0) {
+          // Move bytes from the read buffer into the caller's buffer.
+          read = readBuffer.read(sink, Math.min(byteCount, readBuffer.size()));
+          unacknowledgedBytesRead += read;
+        }
 
-        // Flow control: notify the peer that we're ready for more data!
-        unacknowledgedBytesRead += read;
-        if (unacknowledgedBytesRead
-            >= connection.okHttpSettings.getInitialWindowSize() / 2) {
+        if (errorCode == null
+            && unacknowledgedBytesRead >= connection.okHttpSettings.getInitialWindowSize() / 2) {
+          // Flow control: notify the peer that we're ready for more data! Only send a WINDOW_UPDATE
+          // if the stream isn't in error.
           connection.writeWindowUpdateLater(id, unacknowledgedBytesRead);
           unacknowledgedBytesRead = 0;
         }
       }
 
-      // Update connection.unacknowledgedBytesRead outside the stream lock.
-      synchronized (connection) { // Multiple application threads may hit this section.
-        connection.unacknowledgedBytesRead += read;
-        if (connection.unacknowledgedBytesRead
-            >= connection.okHttpSettings.getInitialWindowSize() / 2) {
-          connection.writeWindowUpdateLater(0, connection.unacknowledgedBytesRead);
-          connection.unacknowledgedBytesRead = 0;
-        }
+      if (read != -1) {
+        // Update connection.unacknowledgedBytesRead outside the stream lock.
+        updateConnectionFlowControl(read);
+        return read;
       }
 
-      return read;
+      if (errorCode != null) {
+        // We defer throwing the exception until now so that we can refill the connection
+        // flow-control window. This is necessary because we don't transmit window updates until the
+        // application reads the data. If we throw this prior to updating the connection
+        // flow-control window, we risk having it go to 0 preventing the server from sending data.
+        throw new StreamResetException(errorCode);
+      }
+
+      return -1; // This source is exhausted.
+    }
+
+    private void updateConnectionFlowControl(long read) {
+      assert (!Thread.holdsLock(Http2Stream.this));
+      connection.updateConnectionFlowControl(read);
     }
 
     /** Returns once the source is either readable or finished. */
@@ -421,21 +446,17 @@ public final class Http2Stream {
     }
 
     @Override public void close() throws IOException {
+      long bytesDiscarded;
       synchronized (Http2Stream.this) {
         closed = true;
+        bytesDiscarded = readBuffer.size();
         readBuffer.clear();
         Http2Stream.this.notifyAll();
       }
+      if (bytesDiscarded > 0) {
+        updateConnectionFlowControl(bytesDiscarded);
+      }
       cancelStreamIfNecessary();
-    }
-
-    private void checkNotClosed() throws IOException {
-      if (closed) {
-        throw new IOException("stream closed");
-      }
-      if (errorCode != null) {
-        throw new StreamResetException(errorCode);
-      }
     }
   }
 
@@ -458,10 +479,8 @@ public final class Http2Stream {
     }
   }
 
-  /**
-   * A sink that writes outgoing data frames of a stream. This class is not thread safe.
-   */
-  final class FramedDataSink implements Sink {
+  /** A sink that writes outgoing data frames of a stream. This class is not thread safe. */
+  final class FramingSink implements Sink {
     private static final long EMIT_BUFFER_SIZE = 16384;
 
     /**
@@ -481,7 +500,7 @@ public final class Http2Stream {
       assert (!Thread.holdsLock(Http2Stream.this));
       sendBuffer.write(source, byteCount);
       while (sendBuffer.size() >= EMIT_BUFFER_SIZE) {
-        emitDataFrame(false);
+        emitFrame(false);
       }
     }
 
@@ -489,7 +508,7 @@ public final class Http2Stream {
      * Emit a single data frame to the connection. The frame's size be limited by this stream's
      * write window. This method will block until the write window is nonempty.
      */
-    private void emitDataFrame(boolean outFinished) throws IOException {
+    private void emitFrame(boolean outFinished) throws IOException {
       long toWrite;
       synchronized (Http2Stream.this) {
         writeTimeout.enter();
@@ -520,7 +539,7 @@ public final class Http2Stream {
         checkOutNotClosed();
       }
       while (sendBuffer.size() > 0) {
-        emitDataFrame(false);
+        emitFrame(false);
         connection.flush();
       }
     }
@@ -538,7 +557,7 @@ public final class Http2Stream {
         // Emit the remaining data, setting the END_STREAM flag on the last frame.
         if (sendBuffer.size() > 0) {
           while (sendBuffer.size() > 0) {
-            emitDataFrame(true);
+            emitFrame(true);
           }
         } else {
           // Send an empty frame just so we can set the END_STREAM flag.
@@ -579,6 +598,7 @@ public final class Http2Stream {
     try {
       wait();
     } catch (InterruptedException e) {
+      Thread.currentThread().interrupt(); // Retain interrupted status.
       throw new InterruptedIOException();
     }
   }
